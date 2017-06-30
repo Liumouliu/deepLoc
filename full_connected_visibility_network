@@ -1,0 +1,690 @@
+%% impose all the pairwise visibility rank
+
+%% train the network
+%% add paths
+
+% matconvnet
+run  /home/liu/matconvnet-1.0-beta24/matlab/vl_setupnn
+
+addpath(genpath('/home/liu/netvlad-master/Code'));
+addpath('/home/liu/netvlad-master/yael_dummy');
+
+%% load the data
+root_dir = '/media/liu/Samsung_T3/Sf_0/';
+% load([root_dir 'sf0.mat']);
+bool_dataset = exist( 'tlines', 'var');
+if bool_dataset == 0
+    load([root_dir 'sf0_small.mat']);
+end
+
+%% load the pre-trained network
+opts= struct(...
+        'netID', 'vd16', ...
+        'layerName', 'conv5_3', ...
+        'method', 'max_relu', ...
+        'batchSize', 4, ...
+        'learningRate', 0.0001, ...
+        'lrDownFreq', 5, ...
+        'lrDownFactor', 2, ...
+        'weightDecay', 0.001, ...
+        'momentum', 0.9, ...
+        'backPropToLayer', 'conv5_1', ...
+        'fixLayers', [], ...
+        'nNegChoice', 1000, ...
+        'nNegCap', 10, ...
+        'nNegCache', 10, ...
+        'nEpoch', 30, ...
+        'margin', 0.1, ...
+        'excludeVeryHard', false, ...
+        'jitterFlip', false, ...
+        'jitterScale', [], ...
+        'sessionID', [], ...
+        'outPrefix', [], ...
+        'dbCheckpoint0', [], ...
+        'qCheckpoint0', [], ...
+        'dbCheckpoint0val', [], ...
+        'qCheckpoint0val', [], ...
+        'checkpoint0suffix', '', ...
+        'info', '', ...
+        'test0', true, ...
+        'saveFrequency', 1000, ...
+        'compFeatsFrequency', 800, ...
+        'computeBatchSize', 10, ...
+        'epochTestFrequency', 1, ... % recommended not to be changed (pickBestNet won't work otherwise)
+        'doDraw', false, ...
+        'printLoss', false, ...
+        'printBatchLoss', false, ...
+        'nTestSample', 1000, ...
+        'nTestRankSample', 5000, ...
+        'recallNs', [1:5, 10:5:100], ...
+        'useGPU', true, ...
+        'numThreads', 8, ...
+        'startEpoch', 1 ...
+        );
+    
+% continue from previous epoch
+% bRestart = false;
+bRestart = true;
+
+opts.startEpoch = 1;
+if isempty(opts.sessionID),
+    if opts.startEpoch>1, error('Have to specify sessionID to restart'); end
+    rng('shuffle'); opts.sessionID= relja_randomHex(4);
+end
+
+if opts.startEpoch == 1
+    opts.sessionID = [];
+end
+sessionID= opts.sessionID;
+    
+    
+% bool_dataset = exist( 'net', 'var');
+% if bool_dataset == 0
+    net= loadPreTrainedNet(opts.netID, opts.layerName, '/home/liu/netvlad-master/Data/pretrained');
+% end
+
+%%
+% --- Add my layers
+net= addLayers_mac(net, opts);
+
+%%
+% --- BackProp depth
+if isempty(opts.backPropToLayer)
+    opts.backPropToLayer= 1;
+else
+    if ~isnumeric( opts.backPropToLayer )
+        assert( isstr(opts.backPropToLayer) );
+        opts.backPropToLayer= relja_whichLayer(net, opts.backPropToLayer);
+    end
+end
+opts.backPropToLayerName= net.layers{opts.backPropToLayer}.name;
+opts.backPropDepth= length(net.layers)-opts.backPropToLayer+1;
+if isempty(opts.fixLayers), opts.fixLayers= {}; end;
+assert( all(ismember(opts.fixLayers, relja_layerNames(net))) );
+
+% display(opts);
+
+%%
+
+
+%%
+
+opts.outPrefix = '/media/liu/Samsung_2/deep_sf0/output/';
+
+%% restart or continue from previous epoches
+
+if opts.startEpoch<2 && bRestart
+    % ----- Checkpoint names
+    
+    if ~isempty(opts.checkpoint0suffix)
+        opts.checkpoint0suffix= [opts.checkpoint0suffix, '_'];
+    end
+    if isempty(opts.dbCheckpoint0)
+        opts.dbCheckpoint0= sprintf('%s%s_%s_%s_%s_%sdb.bin', opts.outPrefix, sf0_train.whichSet, opts.netID, opts.layerName, opts.method, opts.checkpoint0suffix);
+    end
+    if isempty(opts.qCheckpoint0)
+        opts.qCheckpoint0= sprintf('%s%s_%s_%s_%s_%sq.bin', opts.outPrefix, sf0_train.whichSet, opts.netID, opts.layerName, opts.method, opts.checkpoint0suffix);
+    end
+    if isempty(opts.dbCheckpoint0val)
+        opts.dbCheckpoint0val= sprintf('%s%s_%s_%s_%s_%sdb.bin', opts.outPrefix, sf0_validation.whichSet, opts.netID, opts.layerName, opts.method, opts.checkpoint0suffix);
+    end
+    if isempty(opts.qCheckpoint0val)
+        opts.qCheckpoint0val= sprintf('%s%s_%s_%s_%s_%sq.bin', opts.outPrefix, sf0_validation.whichSet, opts.netID, opts.layerName, opts.method, opts.checkpoint0suffix);
+    end
+
+    auxData= {};
+    auxData.epochStartTime= {};
+    auxData.numTrain= sf0_train.numQueries;
+    auxData.negCache= cell(sf0_train.numQueries, 1);
+    obj= struct();
+    obj.train= struct('loss', [], 'recall', [], 'rankloss', []);
+    obj.val= struct('loss', [], 'recall', [], 'rankloss', []);
+
+else
+    
+    % ----- Continue from an epoch
+        
+    ID= sprintf('ep%06d_latest', opts.startEpoch);
+    outFnCurrent= sprintf('%s%s_%s.mat', opts.outPrefix, opts.sessionID, ID);
+    tmpopts= opts;
+    load(outFnCurrent, 'net', 'obj', 'opts', 'auxData','trainOrderStartEpoch','iBatchStartEpoch'); % rewrites opts
+    clear ID outFnCurrent;
+
+    opts.startEpoch= tmpopts.startEpoch;
+    opts.test0= false;
+    opts.useGPU= tmpopts.useGPU;
+    opts.numThreads= tmpopts.numThreads;
+    
+%     ID= sprintf('ep%06d_latest', opts.startEpoch);
+%     trainID= sprintf('%s_train', ID);
+%     valID= sprintf('%s_val', ID);
+%     
+%     sprintf('%s%s_%s', opts.outPrefix, opts.sessionID, trainID)
+
+    if ~isfield(opts, 'dbCheckpoint0_orig')
+        opts.dbCheckpoint0_orig= opts.dbCheckpoint0;
+        opts.qCheckpoint0_orig= opts.qCheckpoint0;
+    end
+    opts.dbCheckpoint0= tmpopts.dbCheckpoint0;
+    opts.qCheckpoint0= tmpopts.qCheckpoint0;
+
+    if isempty(opts.qCheckpoint0)
+        opts.dbCheckpoint0= sprintf('%s%s_%s_%s_%s_%s%s_ep%06d_db.bin', opts.outPrefix, sf0_train.whichSet, opts.netID, opts.layerName, opts.method, opts.checkpoint0suffix, opts.sessionID, opts.startEpoch);
+    end
+    if isempty(opts.qCheckpoint0)
+        opts.qCheckpoint0= sprintf('%s%s_%s_%s_%s_%s%s_ep%06d_q.bin', opts.outPrefix, sf0_train.whichSet, opts.netID, opts.layerName, opts.method, opts.checkpoint0suffix, opts.sessionID, opts.startEpoch);
+    end
+
+    display(opts);
+    
+    
+    
+end
+
+% --- Prepare for train
+net= netPrepareForTrain(net, opts.backPropToLayer);
+
+if opts.useGPU
+    net= relja_simplenn_move(net, 'gpu');
+end
+
+if ~exist(opts.qCheckpoint0, 'file')
+    serialAllFeats(net, [root_dir,'images/'], imageNames(sf0_train.query_training,1), ...
+            opts.qCheckpoint0, 'useGPU', opts.useGPU, 'batchSize', opts.computeBatchSize);
+end
+
+if ~exist(opts.dbCheckpoint0, 'file')
+    serialAllFeats(net, [root_dir,'images/'], imageNames(sf0_train.db_training,1), ...
+        opts.dbCheckpoint0, 'useGPU', opts.useGPU, 'batchSize', opts.computeBatchSize);
+end
+
+if opts.test0
+    if ~exist(opts.qCheckpoint0val, 'file')
+        serialAllFeats(net, [root_dir,'images/'], imageNames(sf0_validation.query_training,1), ...
+            opts.qCheckpoint0val, 'useGPU', opts.useGPU, 'batchSize', opts.computeBatchSize);
+    end
+    if ~exist(opts.dbCheckpoint0val, 'file')
+        serialAllFeats(net, [root_dir,'images/'], imageNames(sf0_validation.db_training,1), ...
+            opts.dbCheckpoint0val, 'useGPU', opts.useGPU, 'batchSize', opts.computeBatchSize);
+    end
+
+    %% commented by liu for reading the code
+    % test the recall and rank loss before training
+    % for the top N retreived images, if they share 3D points with the
+    % query image, the query image is deemed to be localized. If they share
+    % cartoid id with the query image, the query image is also deemed to be
+    % localized
+%     [obj.pretrain.train.recall, obj.pretrain.train.rankloss,~,~,obj.pretrain.train.ranklossPlace]= ...
+%     testFromFnSf0(sf0_train, cartoid, tlines, opts.dbCheckpoint0, opts.qCheckpoint0, opts);    
+
+    %         [obj.pretrain.val.recall, obj.pretrain.val.rankloss]= ...
+%             testFromFn(dbVal, opts.dbCheckpoint0val, opts.qCheckpoint0val, opts);
+%         [obj.pretrain.train.recall, obj.pretrain.train.rankloss]= ...
+%             testFromFn(dbTrain, opts.dbCheckpoint0, opts.qCheckpoint0, opts);
+end
+
+qFeat= fread( fopen(opts.qCheckpoint0, 'rb'), inf, 'float32=>single');
+qFeat= reshape(qFeat, [], sf0_train.numQueries);
+nDims= size(qFeat, 1);
+dbFeat= fread( fopen(opts.dbCheckpoint0, 'rb'), [nDims, sf0_train.numImages], 'float32=>single');
+
+assert( relja_netOutputDim(net)==nDims );
+% ----- Training
+
+lr= opts.learningRate;
+nBatches= floor( sf0_train.numQueries / opts.batchSize ); % some might be cut, no biggie
+batchSaveFrequency= ceil(opts.saveFrequency/opts.batchSize);
+batchCompFeatsFrequency= ceil(opts.compFeatsFrequency/opts.batchSize);
+progEpoch= tic;
+
+    
+        
+for iEpoch= 1:opts.nEpoch
+    relja_progress(iEpoch, opts.nEpoch, 'epoch', progEpoch);
+    auxData.epochStartTime{end+1}= datestr(now);
+
+    if iEpoch~=1 && rem(iEpoch, opts.lrDownFreq)==1
+        oldLr= lr;
+        lr= lr/opts.lrDownFactor;
+        relja_display('Changing learning rate from %f to %f', oldLr, lr); clear oldLr;
+        batchCompFeatsFrequency= round(batchCompFeatsFrequency*opts.lrDownFactor);
+    end
+    relja_display('Learning rate %f', lr);
+    % continue from the previous epoches
+    if opts.startEpoch>iEpoch, continue; end
+ 
+    rng(43-1+iEpoch);
+    trainOrder= randperm(sf0_train.numQueries);
+    if ~bRestart && opts.startEpoch==iEpoch
+        trainOrder = trainOrderStartEpoch;
+    end
+    ID= sprintf('ep%06d_latest', iEpoch);
+%     trainID= sprintf('%s_train', ID);
+%     valID= sprintf('%s_val', ID);
+
+    progBatch= tic;
+
+    iQAbs= 1;
+    iPosAbs= 2;
+    
+    covisThre = 10; % thresold set to avoid outofmemory error of GPU
+    
+    for iBatch= 1:nBatches
+        iBatch
+        if ~bRestart && opts.startEpoch==iEpoch
+            if iBatchStartEpoch > iBatch, continue; end
+        end
+    
+        relja_progress(iBatch, nBatches, ...
+            sprintf('%s epoch %d batch', opts.sessionID, iEpoch), progBatch);
+        %% save the  updated network
+        if rem(iBatch, batchSaveFrequency)==0
+            saveNet(net, obj, opts, auxData, ID, sprintf('epoch %d batch %d', iEpoch, iBatch), trainOrder, iBatch);
+            if opts.doDraw, plotResults(obj, opts, auxData); end
+        end
+%         saveNet(net, obj, opts, auxData, ID, sprintf('epoch %d batch %d', iEpoch, iBatch), trainOrder, iBatch);
+        %% recompute the features using the updated network
+
+        if rem(iBatch, batchCompFeatsFrequency)==0 && iBatch~=1 && iBatch~=nBatches
+            clear qFeat dbFeat;
+            [qFeat, dbFeat]= computeAllFeats(root_dir, imageNames, sf0_train, net, opts, iEpoch, false);
+        end
+        
+        
+        qIDs= trainOrder( (iBatch-1)*opts.batchSize + (1:opts.batchSize) );
+            
+        losses= [];
+
+        allRes= [];
+        numTriplets= [];
+        
+        for iQuery= 1:opts.batchSize
+                
+                % ---------- compute closest positive and violating negatives
+
+                qID= qIDs(iQuery);
+                
+%                 qID=124;
+                
+                qID_map = sf0_train.query_training(qID);
+                potPosIDs_map = tlines{qID_map,1}(:,1);
+                
+                if length(potPosIDs_map) > covisThre
+                    potPosIDs_map = potPosIDs_map(1:covisThre);
+                end
+                
+                potPosIDs = arrayfun(@(x)find(sf0_train.db_training  == x,1),potPosIDs_map,'un',0);
+                potPosIDs = cell2mat(potPosIDs(~cellfun('isempty',potPosIDs)));
+                
+                %% the postiveness of positive images is ranked 
+                if isempty(potPosIDs), continue; end
+                
+                % hard negatives
+                negIDs= samplenegtives(sf0_train,potPosIDs,opts.nNegChoice);
+                % combine with the hard negtives in history
+                negIDs= unique([auxData.negCache{qID}; negIDs]);
+                [inds, dsSq]= yael_nn( ...
+                    dbFeat(:, negIDs), ...
+                    qFeat(:, qID), ...
+                    min(opts.nNegCap*10, length(negIDs)) ... % 10x is hacky but fine
+                    );
+                negIDs= negIDs(inds);
+                % store the hard negtives in cache
+                auxData.negCache{qID}= negIDs(1:min(opts.nNegCache, length(negIDs)));
+                
+                % compute the distances of all positives
+
+                dPos= sum( bsxfun(@minus, dbFeat(:, potPosIDs), qFeat(:, qID)).^2, 1 );
+
+                % veryHardNegs is defined as the smaller than the minimal
+                % distance in the positive cluster
+                veryHardNegs= dsSq < min(dPos);
+                
+                % violatingNegs is defined as the negtive is smaller than
+                % most like neg postive
+                violatingNegs= dsSq < max(dPos) + opts.margin;
+                if opts.excludeVeryHard
+                    violatingNegs= violatingNegs & ~veryHardNegs;
+                end
+                nViolatingNegs= sum(violatingNegs);
+                nVeryHardNegs= sum(veryHardNegs);
+                
+                dPosChanllenge = max(dPos);
+                if opts.printLoss
+                    % the inter place loss
+                    loss= sum( max(dPosChanllenge + opts.margin - dsSq, 0) );
+                    
+                    % the intro place loss
+                    if length(dPos) > 1
+                       loss = loss + sum( max(dPos(1:end-1) + opts.margin - dPos(2:end), 0) );
+                    end
+                    relja_display('%s loss= %.4f, #violate= %d, #vhard= %d, (qID=%d)', ...
+                        opts.sessionID, loss, nViolatingNegs, nVeryHardNegs, qID);
+                end
+                if nViolatingNegs==0, losses(end+1)= 0; continue; end
+                negIDs= negIDs(violatingNegs);
+                dsSq= dsSq(violatingNegs);
+                if nViolatingNegs>opts.nNegCap
+                    [~, sortNegInds]= sort(dsSq); % not needed if using yael_nn below sampleNegsQ
+                    negIDs= negIDs( sortNegInds(1:opts.nNegCap) );
+                end
+                % ---------- load images, normalize them
+               
+                pos_ind_range = 1:length(potPosIDs);
+                neg_ind_range = length(potPosIDs)+1: length(potPosIDs) + length(negIDs);
+                imageFns= [ [root_dir,'images/', imageNames{sf0_train.query_training(qID),1}]; ... % query
+                strcat(root_dir,'images/', imageNames(sf0_train.db_training(potPosIDs),1) ); ... % positives
+                strcat(root_dir,'images/', imageNames(sf0_train.db_training(negIDs),1) )]; % negtive
+% montage(imageFns(1:10), 'Size', [2 5]);
+
+                thisNumIms= length(imageFns);
+                
+                if isempty(opts.jitterScale)
+                    ims_= vl_imreadjpeg(imageFns, 'numThreads', opts.numThreads);
+                else
+                    sc= opts.jitterScale( randsample(length(opts.jitterScale), 1) );
+                    ims_= vl_imreadjpeg(imageFns, 'numThreads', opts.numThreads, 'Resize', round(sc*origImS));
+                end
+                
+                % fix non-colour images
+                for iIm= 1:thisNumIms
+                    if size(ims_{iIm},3)==1
+                        ims_{iIm}= cat(3,ims_{iIm},ims_{iIm},ims_{iIm});
+                    end
+                end
+                ims= cat(4, ims_{:});
+                
+                ims(:,:,1,:)= ims(:,:,1,:) - net.meta.normalization.averageImage(1,1,1);
+                ims(:,:,2,:)= ims(:,:,2,:) - net.meta.normalization.averageImage(1,1,2);
+                ims(:,:,3,:)= ims(:,:,3,:) - net.meta.normalization.averageImage(1,1,3);
+                
+                if opts.jitterFlip && rand()>0.5
+                    ims= ims(:,end:-1:1,:,:);
+                end
+                
+                if opts.useGPU
+                    ims= gpuArray(ims);
+                end
+                
+                % ---------- forward
+                
+                res= vl_simplenn(net, ims, [], [], 'mode', 'normal', 'conserveMemory', true); % the memory saving related to backPropDepth is obayed implicitly due to running netPrepareForTrain before, see the comments in the function for an explanation
+                if opts.backPropToLayer==1, res(1).x= ims; end % because of the 'conserveMemory' the input is deleted, restore it if needed
+                ims= [];
+                feats= reshape( gather(res(end).x), [], thisNumIms );
+                
+                % ---------- compute real distances and violating negs
+                
+                dsSq= sum( bsxfun(@minus, feats(:, 1), feats(:, 2:end)) .^2, 1 )';
+%                 dPos= dsSq(1);
+                veryHardNegs= dsSq(neg_ind_range) < min(dsSq(pos_ind_range));
+                violatingNegs= dsSq(neg_ind_range) < max(dsSq(pos_ind_range)) + opts.margin;
+                if opts.excludeVeryHard
+                    violatingNegs= violatingNegs & ~veryHardNegs;
+                end
+                nViolatingNegs= sum(violatingNegs);
+                nVeryHardNegs= sum(veryHardNegs);
+                if nViolatingNegs==0, continue; end
+                
+                [dPosChanllenge, iPosAbs] = max(dsSq(pos_ind_range));
+                
+                iPosAbs = iPosAbs +1;
+                loss= sum( max(dPosChanllenge + opts.margin - dsSq(neg_ind_range), 0) );
+                
+                nb_coVisImages= length(pos_ind_range);
+                    
+                % the intro place loss
+                % more than 1 co-visible images found, means that we need
+                % to impose the ranking cost
+                lambada = 1.0;
+                if nb_coVisImages > 1
+                    dPos = dsSq(pos_ind_range);
+                    
+                    % compute the losses inside the co-visible images
+                    
+                    loss_intra_co_visibles = zeros(1, nb_coVisImages*(nb_coVisImages-1)/2);
+                    
+                    counters = 1;
+                    
+                    for a = 1:nb_coVisImages-1
+                        for b = a+1:nb_coVisImages
+                            loss_intra_co_visibles(counters) = max(dPos(a) + opts.margin - dPos(b), 0);
+                            counters = counters + 1;
+                        end
+                    end
+                    
+                    ind_hinge = find(loss_intra_co_visibles~=0); % ind_hinge stores the indexes of violating positive pairs
+                    
+                    % convert the ind_hinge to voilating indexes for each
+                    % co-visible image
+                    coVisInds = cell(nb_coVisImages,1);
+                    
+                    seqInds = cumsum(linspace(nb_coVisImages-1,1,nb_coVisImages-1));
+                    
+                    nb_ind_hinge = length(ind_hinge);
+                    
+                    for a = 1:nb_ind_hinge
+                        
+                        tps = min(find(seqInds>=ind_hinge(a)));
+                        
+                        if tps == 1
+                            coVisInds{tps,1} = [coVisInds{tps,1} ind_hinge(a)+1];
+                            
+                            coVisInds{ind_hinge(a)+1,1} = [coVisInds{ind_hinge(a)+1,1} tps];
+                            
+                        else
+                            
+                            subind = ind_hinge(a) - seqInds(tps-1);
+                            coVisInds{tps,1} = [coVisInds{tps,1} tps + subind];
+                            
+                            coVisInds{tps + subind,1} = [coVisInds{tps + subind,1} tps];                           
+                            
+                        end
+                        
+                        
+                    end
+                    
+                    lambada = nb_ind_hinge/(nViolatingNegs+1e-18);
+                    
+                    
+%                     loss_intra = max(dPos(1:end-1) + opts.margin - dPos(2:end), 0);
+%                     
+%                     ind_hinge = find(loss_intra~=0); % ind_hinge stores the indexes of violating positive pairs
+                    
+                    
+                   loss = lambada*loss + sum( loss_intra_co_visibles );
+                end
+                    
+                    
+%                 loss= sum( max(dPos + opts.margin - dsSq(2:end), 0) );
+%                 if opts.printLoss
+                    relja_display('   real loss= %.4f, #violate= %d, #vhard= %d, (qID=%d)', ...
+                        loss, nViolatingNegs, nVeryHardNegs, qID);
+%                 end
+                losses(end+1)= loss;
+                
+                
+                violatingNegAbsInds = length(potPosIDs)+1+find(violatingNegs);
+                % ---------- gradients
+                
+                dzdy= zeros(size(feats,1), thisNumIms, 'single');
+                
+                % 1-qID, 2-pos, 3:end-neg
+                
+                % grad(feat_query)
+                dzdy(:, iQAbs)= 2*lambada*( ...
+                    sum(feats(:, violatingNegAbsInds), 2) ...
+                    - nViolatingNegs*feats(:, iPosAbs) ) ;
+                
+                if length(pos_ind_range) > 1
+                    
+                    for a = 1:nb_coVisImages
+                       
+                        temp = coVisInds{a,1}(find(coVisInds{a,1}>a));
+                        if ~isempty(temp)
+                            dzdy(:, iQAbs)= dzdy(:, iQAbs) + 2*(sum(feats(:, temp+iQAbs),2)-length(temp)*feats(:, a+iQAbs)) ;
+                        end
+                        
+                    end
+                    
+                    
+                    
+%                     grad_intro = 2*(dPos(2:end)-dPos(1:end-1) );
+%                     dzdy(:, iQAbs)= dzdy(:, iQAbs) + sum(grad_intro(ind_hinge));
+%                 
+                
+                % grad(feat_pos)
+                
+                for a = 1:nb_coVisImages
+                    temp = coVisInds{a,1};
+                    
+                    if ~isempty(temp)
+                        
+                        inds_greater = length(find(coVisInds{a,1}>a));
+                        
+                        nb_diffs = inds_greater - (length(coVisInds{a,1}) - inds_greater);
+                        dzdy(:, iQAbs + a)=  2* nb_diffs * ( feats(:, iQAbs + a)-feats(:, iQAbs) );
+                    end
+                    
+                    
+                end
+                
+
+                
+                end
+               
+                dzdy(:, iPosAbs)= dzdy(:, iPosAbs) + 2*lambada* ...
+                    nViolatingNegs * ( feats(:, iPosAbs)-feats(:, iQAbs) );
+       
+                % grad(feat_neg)
+                dzdy(:, violatingNegAbsInds)= 2* (...
+                     bsxfun(@minus, feats(:, iQAbs), feats(:, violatingNegAbsInds))  );
+                
+                if opts.useGPU
+                    dzdy= gpuArray(dzdy);
+                end
+                
+                % ---------- backward pass
+                allRes= [allRes; ...
+                    vl_simplenn(net, ims, dzdy, res, ...
+                        'mode', 'normal', ...
+                        'skipForward', true, ...
+                        'backPropDepth', opts.backPropDepth, ...
+                        'conserveMemory', true)];
+                numTriplets= [numTriplets, nViolatingNegs];
+%                 potPosIDAll= tlines{sf0_train.query_training(qID),1}(:,1);
+%                 potPosIDs = arrayfun(@(x)find(sf0_train.db_training  == x,1),potPosIDAll);
+%                 
+%                 
+%                 % ----- closest positive
+%                 
+%                 [posID, dPos]= yael_nn( ...
+%                     dbFeat(:, potPosIDs), ...
+%                     qFeat(:, qID), ...
+%                     1 );
+%                 posID= potPosIDs(posID);
+        end
+        
+         clear res;
+            
+            if isempty(losses)
+                loss= 0;
+            else
+                loss= mean(losses);
+            end
+            
+            obj.train.loss(end+1)= loss;
+            if opts.printBatchLoss
+                relja_display('%s batchloss= %.4f', opts.sessionID, loss);
+            end
+            
+            thisBatchSize= sum(numTriplets);
+            
+            if thisBatchSize > 0
+                
+                % ---------- train
+                
+                for l= 1:numel(net.layers)
+                    for j= 1:numel(allRes(1, l).dzdw)
+                        if ismember(net.layers{l}.name, opts.fixLayers) continue; end
+                        
+                        dzdw= allRes(1, l).dzdw{j};
+                        
+%                         tempss = 1;
+                        for iQuery= 2:size(allRes,1)
+                            dzdw= dzdw + allRes(iQuery, l).dzdw{j};
+                            
+%                             tempss = tempss +1;
+                        end
+                        
+%                         tempss
+                        
+%                         thisBatchSize
+                        
+                        thisDecay= opts.weightDecay * net.layers{l}.weightDecay(j);
+                        thisLR= lr * net.layers{l}.learningRate(j);
+                        
+                        net.layers{l}.momentum{j}= ...
+                            opts.momentum * net.layers{l}.momentum{j} ...
+                            - thisDecay * net.layers{l}.weights{j} ...
+                            - (1 / size(allRes,1)) * dzdw;
+                        net.layers{l}.weights{j}= net.layers{l}.weights{j} + thisLR * net.layers{l}.momentum{j};
+                    end
+                end
+                
+                clear dzdw;
+            end
+            
+            clear allRes;
+        
+    end
+        
+end
+
+
+saveNet(net, obj, opts, auxData, ID, sprintf('epoch %d batch %d', iEpoch, iBatch), trainOrder, iBatch);
+
+
+% %%
+%  % ---------- load images, normalize them
+%                 
+% imageFns= [ [root_dir,'images/', imageNames{sf0_train.query_training(1),1}]; ...
+%     strcat( root_dir,'images/', imageNames(tlines{sf0_train.query_training(1),1}(:,1),1) ) ];
+% thisNumIms= length(imageFns);
+% 
+% if isempty(opts.jitterScale)
+%     ims_= vl_imreadjpeg(imageFns, 'numThreads', opts.numThreads);
+% else
+%     sc= opts.jitterScale( randsample(length(opts.jitterScale), 1) );
+%     ims_= vl_imreadjpeg(imageFns, 'numThreads', opts.numThreads, 'Resize', round(sc*origImS));
+% end
+% 
+% % fix non-colour images
+% for iIm= 1:thisNumIms
+%     if size(ims_{iIm},3)==1
+%         ims_{iIm}= cat(3,ims_{iIm},ims_{iIm},ims_{iIm});
+%     end
+% end
+% ims= cat(4, ims_{:});
+% 
+% ims(:,:,1,:)= ims(:,:,1,:) - net.meta.normalization.averageImage(1,1,1);
+% ims(:,:,2,:)= ims(:,:,2,:) - net.meta.normalization.averageImage(1,1,2);
+% ims(:,:,3,:)= ims(:,:,3,:) - net.meta.normalization.averageImage(1,1,3);
+% 
+% if opts.jitterFlip && rand()>0.5
+%     ims= ims(:,end:-1:1,:,:);
+% end
+% 
+% if opts.useGPU
+%     ims= gpuArray(ims);
+% end
+% 
+% % ---------- forward
+%                 
+% res= vl_simplenn(net, ims, [], [], 'mode', 'normal', 'conserveMemory', true); % the memory saving related to backPropDepth is obayed implicitly due to running netPrepareForTrain before, see the comments in the function for an explanation
+% if opts.backPropToLayer==1, res(1).x= ims; end % because of the 'conserveMemory' the input is deleted, restore it if needed
+% ims= [];
+% feats= reshape( gather(res(end).x), [], thisNumIms );
+% 
+% feats_u = reshape( gather(res(30).x), [], 512,thisNumIms );
+% % feats_u1 = reshape( gather(res(33).x), [], thisNumIms );
